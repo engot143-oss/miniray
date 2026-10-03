@@ -1,0 +1,5 @@
+# Miniray's local database and memory. Never committed.
+data/
+*.db
+__pycache__/
+*.pyc
