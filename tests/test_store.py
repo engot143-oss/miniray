@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from miniray.store import SCHEMA_VERSION, MinirayError, Store
 
@@ -154,10 +155,20 @@ class PersistenceTests(StoreTestCase):
         with conn:
             conn.execute("UPDATE meta SET value = '999' WHERE key = 'schema_version'")
         conn.close()
-        with self.assertRaises(MinirayError):
-            Store(self.db_path)
-        self.store = Store.__new__(Store)  # keep tearDown happy
-        self.store.conn = sqlite3.connect(":memory:")
+        opened = []
+        real_connect = sqlite3.connect
+
+        def tracking_connect(*args, **kwargs):
+            opened.append(real_connect(*args, **kwargs))
+            return opened[-1]
+
+        with mock.patch("miniray.store.sqlite3.connect", tracking_connect):
+            with self.assertRaises(MinirayError):
+                Store(self.db_path)
+        # The refused connection must be closed, or Windows keeps the file locked.
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            opened[0].execute("SELECT 1")
 
 
 if __name__ == "__main__":

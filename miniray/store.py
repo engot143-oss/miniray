@@ -81,8 +81,12 @@ class Store:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self._migrate()
+        try:
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            self._migrate()
+        except Exception:
+            self.conn.close()  # don't leave the file open (Windows locks it)
+            raise
 
     def close(self) -> None:
         self.conn.close()
