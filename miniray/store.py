@@ -6,10 +6,14 @@ Everything Miniray remembers lives in one SQLite file:
   tasks     - work items with a status
   context   - key/value memory that survives restarts
   activity  - an append-only log of what happened
+
+It can also make a verified SQLite backup of that file, or export its
+contents as JSON. Restore/import is intentionally not implemented.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -73,6 +77,22 @@ class MinirayError(Exception):
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+EXPORT_FORMAT = "miniray-export"
+EXPORT_FORMAT_VERSION = 1
+
+
+def _claim_new_file(dest: Path) -> None:
+    """Create dest as an empty file, refusing if anything is already there.
+
+    Exclusive creation is atomic, so an existing file is never overwritten.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        open(dest, "xb").close()
+    except FileExistsError:
+        raise MinirayError(f"Refusing to overwrite existing file: {dest}") from None
 
 
 class Store:
@@ -303,4 +323,116 @@ class Store:
             "context_keys": self.conn.execute("SELECT COUNT(*) FROM context").fetchone()[0],
             "activity_entries": self.conn.execute("SELECT COUNT(*) FROM activity").fetchone()[0],
             "sessions": self.count_activity("session.start"),
+        }
+
+    # -- backup / export ---------------------------------------------------
+
+    def backup_to(self, dest: Path) -> dict:
+        """Copy the database to a new file with SQLite's backup API, then verify it.
+
+        On any failure the partial backup file is removed and the error re-raised.
+        """
+        dest = Path(dest)
+        _claim_new_file(dest)
+        try:
+            target = sqlite3.connect(str(dest))
+            try:
+                self.conn.backup(target)
+            finally:
+                target.close()
+            result = self._verify_backup(dest)
+        except Exception:
+            dest.unlink(missing_ok=True)
+            raise
+        result["logged"] = self._try_log("backup", dest.name)
+        return result
+
+    def _try_log(self, kind: str, detail: str) -> bool:
+        """Log after a backup/export already succeeded. If the database is busy
+        (e.g. another Miniray window is writing), report it instead of failing."""
+        try:
+            self.log(kind, detail)
+            return True
+        except sqlite3.OperationalError:
+            return False
+
+    def _verify_backup(self, dest: Path) -> dict:
+        """Open the backup read-only and check it matches this database."""
+        expected_id = self.identity().get("instance_id")
+        source = self.status_summary()
+        conn = sqlite3.connect(dest.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                raise MinirayError(f"Backup failed SQLite integrity check: {integrity}")
+            row = conn.execute(
+                "SELECT value FROM identity WHERE key = 'instance_id'"
+            ).fetchone()
+            if row is None or row[0] != expected_id:
+                raise MinirayError("Backup instance ID does not match the live database.")
+            schema = int(conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0])
+            tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            context_keys = conn.execute("SELECT COUNT(*) FROM context").fetchone()[0]
+            activity = conn.execute("SELECT COUNT(*) FROM activity").fetchone()[0]
+        finally:
+            conn.close()
+        if tasks != sum(source["tasks"].values()) or context_keys != source["context_keys"]:
+            raise MinirayError(
+                "Backup contents do not match the live database "
+                "(was it changed during the backup?). Try again."
+            )
+        return {
+            "path": dest,
+            "integrity": integrity,
+            "instance_id": row[0],
+            "schema_version": schema,
+            "tasks": tasks,
+            "context_keys": context_keys,
+            "activity_entries": activity,
+        }
+
+    def export_data(self) -> dict:
+        """Everything Miniray remembers, as plain data, read in one consistent snapshot."""
+        def rows(sql: str) -> list:
+            return [dict(r) for r in self.conn.execute(sql)]
+
+        self.conn.execute("BEGIN")
+        try:
+            identity = self.identity()
+            return {
+                "format": EXPORT_FORMAT,
+                "format_version": EXPORT_FORMAT_VERSION,
+                "miniray_version": __version__,
+                "schema_version": self.schema_version(),
+                "exported_at": now(),
+                "instance_id": identity.get("instance_id"),
+                "identity": identity,
+                "tasks": rows("SELECT * FROM tasks ORDER BY id"),
+                "context": rows("SELECT * FROM context ORDER BY key"),
+                "activity": rows("SELECT * FROM activity ORDER BY id"),
+            }
+        finally:
+            self.conn.rollback()  # read-only snapshot; nothing to commit
+
+    def export_to(self, dest: Path) -> dict:
+        """Write export_data() to a new UTF-8 JSON file. Never overwrites."""
+        dest = Path(dest)
+        data = self.export_data()
+        _claim_new_file(dest)
+        try:
+            with open(dest, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+        except Exception:
+            dest.unlink(missing_ok=True)
+            raise
+        logged = self._try_log("export", dest.name)
+        return {
+            "path": dest,
+            "logged": logged,
+            "tasks": len(data["tasks"]),
+            "context_keys": len(data["context"]),
+            "activity_entries": len(data["activity"]),
         }

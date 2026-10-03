@@ -9,7 +9,9 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
+import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, TextIO
 
@@ -85,6 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
     h = sub.add_parser("history", help="show recent activity")
     h.add_argument("-n", "--limit", type=int, default=20)
     h.add_argument("--kind", help="filter, e.g. task or context.set")
+
+    b = sub.add_parser("backup", help="save a verified copy of the database")
+    b.add_argument("--to", help="file or existing folder (default: <data>/backups/)")
+    e = sub.add_parser("export", help="write everything to a readable JSON file")
+    e.add_argument("--to", help="file or existing folder (default: <data>/exports/)")
 
     return p
 
@@ -196,6 +203,53 @@ def cmd_history(store: Store, args, out: TextIO) -> int:
     return 0
 
 
+def _output_path(to: Optional[str], default_dir: Path, prefix: str, ext: str) -> Path:
+    """Where a backup/export goes. A named file is used as-is (and must not exist);
+    a folder or no --to gets a timestamped name that is made unique if needed."""
+    if to:
+        target = Path(to).expanduser()
+        if not target.is_dir():
+            return target
+        default_dir = target
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    candidate = default_dir / f"{prefix}-{stamp}{ext}"
+    n = 2
+    while candidate.exists():
+        candidate = default_dir / f"{prefix}-{stamp}-{n}{ext}"
+        n += 1
+    return candidate
+
+
+def cmd_backup(store: Store, args, out: TextIO) -> int:
+    dest = _output_path(args.to, store.db_path.parent / "backups", "miniray", ".db")
+    try:
+        r = store.backup_to(dest)
+    except (OSError, sqlite3.Error) as e:
+        raise MinirayError(f"Backup failed: {e}") from e
+    print(f"Backup created: {r['path']}", file=out)
+    print(f"  integrity: {r['integrity']}", file=out)
+    print(f"  instance:  {r['instance_id']}", file=out)
+    print(f"  contents:  {r['tasks']} tasks, {r['context_keys']} context keys, "
+          f"{r['activity_entries']} activity entries", file=out)
+    if not r["logged"]:
+        print("  note:      database busy; this entry was not added to the activity log", file=out)
+    return 0
+
+
+def cmd_export(store: Store, args, out: TextIO) -> int:
+    dest = _output_path(args.to, store.db_path.parent / "exports", "miniray-export", ".json")
+    try:
+        r = store.export_to(dest)
+    except (OSError, sqlite3.Error) as e:
+        raise MinirayError(f"Export failed: {e}") from e
+    print(f"Exported to: {r['path']}", file=out)
+    print(f"  contents:  {r['tasks']} tasks, {r['context_keys']} context keys, "
+          f"{r['activity_entries']} activity entries", file=out)
+    if not r["logged"]:
+        print("  note:      database busy; this entry was not added to the activity log", file=out)
+    return 0
+
+
 HANDLERS = {
     "init": cmd_init,
     "status": cmd_status,
@@ -204,6 +258,8 @@ HANDLERS = {
     "task": cmd_task,
     "context": cmd_context,
     "history": cmd_history,
+    "backup": cmd_backup,
+    "export": cmd_export,
 }
 
 SHELL_HELP = """\
@@ -213,6 +269,7 @@ Commands (same as the command line, without 'miniray'):
   task note <id> <text>
   context set <key> <value> | context get|delete <key> | context list
   config list | config get <key> | config set <key> <value>
+  backup [--to PATH] | export [--to PATH]
   help | exit
 Anything else is logged as input (no AI brain installed yet)."""
 
